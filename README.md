@@ -66,7 +66,7 @@ Once configured, you can use these commands in Claude Desktop:
 
 ### Store Information
 ```
-Remember this: The AutoTrader scraping project uses Go with Playwright for browser automation. 
+Remember this: The scraping project uses Go with Playwright for browser automation. 
 The architecture follows domain-driven design with repositories and services.
 
 Category: project
