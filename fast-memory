@@ -1,0 +1,68 @@
+#!/bin/bash
+
+# Fast memory client using HTTP API
+# This connects directly to the HTTP endpoint for instant responses
+
+BASE_URL="http://localhost:8080"
+
+case "$1" in
+    "remember"|"r")
+        if [ -z "$2" ]; then
+            echo "Usage: $0 remember <content> [summary] [category] [tags]"
+            exit 1
+        fi
+        CONTENT="$2"
+        SUMMARY="${3:-}"
+        CATEGORY="${4:-}"
+        TAGS="${5:-}"
+        
+        JSON_DATA="{\"content\":\"$CONTENT\""
+        [ -n "$SUMMARY" ] && JSON_DATA="$JSON_DATA,\"summary\":\"$SUMMARY\""
+        [ -n "$CATEGORY" ] && JSON_DATA="$JSON_DATA,\"category\":\"$CATEGORY\""
+        [ -n "$TAGS" ] && JSON_DATA="$JSON_DATA,\"tags\":[\"$(echo $TAGS | sed 's/,/","/g')\"]"
+        JSON_DATA="$JSON_DATA}"
+        
+        curl -s -X POST "$BASE_URL/remember" \
+             -H "Content-Type: application/json" \
+             -d "$JSON_DATA" | jq -r '.message + " (ID: " + .id + ")"'
+        ;;
+    
+    "recall"|"search"|"s")
+        if [ -z "$2" ]; then
+            echo "Usage: $0 recall <query> [category] [tags] [limit]"
+            exit 1
+        fi
+        QUERY="$2"
+        CATEGORY="${3:-}"
+        TAGS="${4:-}"
+        LIMIT="${5:-10}"
+        
+        JSON_DATA="{\"query\":\"$QUERY\",\"limit\":$LIMIT"
+        [ -n "$CATEGORY" ] && JSON_DATA="$JSON_DATA,\"category\":\"$CATEGORY\""
+        [ -n "$TAGS" ] && JSON_DATA="$JSON_DATA,\"tags\":[\"$(echo $TAGS | sed 's/,/","/g')\"]"
+        JSON_DATA="$JSON_DATA}"
+        
+        curl -s -X POST "$BASE_URL/recall" \
+             -H "Content-Type: application/json" \
+             -d "$JSON_DATA" | jq -r '.[] | "[\(.id[0:8])] \(.summary // .content[0:100])..."'
+        ;;
+    
+    "stats")
+        curl -s "$BASE_URL/stats" | jq .
+        ;;
+        
+    *)
+        echo "Usage: $0 {remember|recall|stats} [args...]"
+        echo ""
+        echo "Commands:"
+        echo "  remember <content> [summary] [category] [tags]  - Store a memory"
+        echo "  recall <query> [category] [tags] [limit]        - Search memories"
+        echo "  stats                                           - Show statistics"
+        echo ""
+        echo "Examples:"
+        echo "  $0 remember 'HTTP API is super fast' 'Speed test' 'performance' 'http,api,fast'"
+        echo "  $0 recall 'Docker async' '' 'development'"
+        echo "  $0 stats"
+        exit 1
+        ;;
+esac

@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  mcp-memory-server:
+    build: .
+    container_name: mcp-memory-server
+    ports:
+      - "8080:8080"
+    volumes:
+      - memory-data:/app/.mcp-memory
+    environment:
+      - MCP_DATA_DIR=/app/.mcp-memory
+      - MCP_LOG_LEVEL=info
+      - MCP_LOG_FORMAT=json
+      - MCP_MAX_STORAGE_SIZE=107374182400  # 100GB
+      - MCP_MAX_FILE_SIZE=104857600        # 100MB
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    networks:
+      - mcp-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  mcp-memory-reporter:
+    build: .
+    container_name: mcp-memory-reporter
+    command: ["./mcp-memory-reporter", "-data-dir", "/app/.mcp-memory", "-port", "9000", "-host", "0.0.0.0"]
+    ports:
+      - "9000:9000"
+    volumes:
+      - memory-data:/app/.mcp-memory:ro  # Read-only access
+    environment:
+      - MCP_LOG_LEVEL=info
+    depends_on:
+      - mcp-memory-server
+    restart: unless-stopped
+    networks:
+      - mcp-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9000/api/stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  memory-data:
+    driver: local
+
+networks:
+  mcp-network:
+    driver: bridge

@@ -1,0 +1,19 @@
+# Development overrides
+# This file is automatically used by docker-compose for local development
+# To use production settings, run: docker-compose -f docker-compose.yml up
+
+version: '3.8'
+
+services:
+  mcp-memory-server:
+    environment:
+      - MCP_LOG_LEVEL=debug
+    volumes:
+      # Mount existing memory data for development
+      - ~/.mcp-memory:/app/.mcp-memory
+
+  mcp-memory-reporter:
+    environment:
+      - MCP_LOG_LEVEL=debug
+    ports:
+      - "9000:9000"

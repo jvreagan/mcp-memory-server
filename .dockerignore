@@ -1,0 +1,30 @@
+# Ignore built binaries
+mcp-memory-server
+mcp-memory-reporter
+
+# Ignore data directories
+.mcp-memory/
+*.log
+
+# Ignore Git
+.git/
+.gitignore
+
+# Ignore Docker files from being copied into context unnecessarily
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Ignore test files
+*_test.go
+test_*
