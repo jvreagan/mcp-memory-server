@@ -56,6 +56,8 @@ Add the following to your Claude Desktop MCP configuration file:
 }
 ```
 
+See `config.example.json` for a complete example with all available configuration options.
+
 3. **Restart Claude Desktop**
 
 The memory server will now be available in your Claude conversations!
@@ -104,12 +106,35 @@ The MCP server provides these tools to Claude:
 
 Configure the server using environment variables:
 
+### Storage Configuration
+
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MCP_DATA_DIR` | Directory for storing memory files | `~/.mcp-memory` |
+| `MCP_MAX_FILE_SIZE` | Maximum size for memory files (bytes) | `104857600` (100MB) |
+| `MCP_MAX_STORAGE_SIZE` | Total storage limit (bytes) | `107374182400` (100GB) |
+
+### Async Behavior Configuration
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MCP_ENABLE_ASYNC` | Enable asynchronous save operations | `true` |
+| `MCP_QUEUE_SIZE` | Size of async save queue | `1000` |
+| `MCP_WORKER_THREADS` | Number of worker threads for async saves | `2` |
+
+### Compression Configuration
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MCP_ENABLE_COMPRESSION` | Enable gzip compression for memory files | `true` |
+| `MCP_COMPRESSION_LEVEL` | Gzip compression level (1-9, where 9 is maximum) | `6` |
+
+### Other Configuration
+
+| Variable | Description | Default |
+|----------|-------------|---------|
 | `MCP_LOG_LEVEL` | Logging level (debug, info, warn, error) | `info` |
 | `MCP_LOG_FORMAT` | Log format (json, text) | `json` |
-| `MCP_MAX_FILE_SIZE` | Maximum size for memory files (bytes) | `104857600` (100MB) |
 | `MCP_MAX_RESULTS` | Maximum search results returned | `20` |
 | `MCP_ENABLE_EMBEDDINGS` | Enable semantic search (future) | `false` |
 | `MCP_EMBEDDING_MODEL` | OpenAI embedding model | `text-embedding-ada-002` |
@@ -132,6 +157,43 @@ Each memory includes:
 - Creation and update timestamps
 - Access statistics and last access time
 - Custom metadata
+
+### Performance Tuning
+
+The server can be tuned for different use cases:
+
+**For high-throughput scenarios:**
+```json
+{
+  "env": {
+    "MCP_ENABLE_ASYNC": "true",
+    "MCP_QUEUE_SIZE": "5000",
+    "MCP_WORKER_THREADS": "4",
+    "MCP_COMPRESSION_LEVEL": "1"
+  }
+}
+```
+
+**For low-latency scenarios:**
+```json
+{
+  "env": {
+    "MCP_ENABLE_ASYNC": "false",
+    "MCP_ENABLE_COMPRESSION": "false"
+  }
+}
+```
+
+**For storage-constrained environments:**
+```json
+{
+  "env": {
+    "MCP_ENABLE_COMPRESSION": "true",
+    "MCP_COMPRESSION_LEVEL": "9",
+    "MCP_MAX_STORAGE_SIZE": "1073741824"
+  }
+}
+```
 
 ## Architecture
 

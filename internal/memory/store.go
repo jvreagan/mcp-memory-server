@@ -66,11 +66,15 @@ func NewStore(dataDir string, cfg *config.StorageConfig, log *logger.Logger) (*S
 		categoryIndex: make(map[string][]string),
 		tagIndex:      make(map[string][]string),
 		memorySizes:   make(map[string]int64),
-		saveQueue:     make(chan *Memory, 1000), // Buffer up to 1000 memories
+		saveQueue:     make(chan *Memory, cfg.QueueSize), // Configurable queue size
 	}
 
-	// Start async save worker
-	go store.saveWorker()
+	// Start async save workers if enabled
+	if cfg.EnableAsync {
+		for i := 0; i < cfg.WorkerThreads; i++ {
+			go store.saveWorker()
+		}
+	}
 
 	// Ensure directories exist
 	if err := store.ensureDirectories(); err != nil {
@@ -86,7 +90,12 @@ func NewStore(dataDir string, cfg *config.StorageConfig, log *logger.Logger) (*S
 		"data_dir", dataDir,
 		"memories_loaded", len(store.index),
 		"total_size", store.totalSize,
-		"max_storage_size", cfg.MaxStorageSize)
+		"max_storage_size", cfg.MaxStorageSize,
+		"async_enabled", cfg.EnableAsync,
+		"worker_threads", cfg.WorkerThreads,
+		"queue_size", cfg.QueueSize,
+		"compression_enabled", cfg.EnableCompression,
+		"compression_level", cfg.CompressionLevel)
 
 	return store, nil
 }
@@ -126,15 +135,39 @@ func (s *Store) Store(content, summary, category string, tags []string, metadata
 	s.updateIndices(memory)
 	s.mu.Unlock()
 
-	// Queue for async file save (slow operations in background)
-	select {
-	case s.saveQueue <- memory:
-		// Successfully queued
-	default:
-		// Queue is full, log warning but don't block
-		s.logger.Warn("Save queue full, memory will be saved synchronously", "id", id)
-		// Fall back to synchronous save
-		go s.saveMemoryAsync(memory)
+	// Save to file based on async configuration
+	if s.config.EnableAsync {
+		// Queue for async file save (slow operations in background)
+		select {
+		case s.saveQueue <- memory:
+			// Successfully queued
+		default:
+			// Queue is full, log warning but don't block
+			s.logger.Warn("Save queue full, memory will be saved synchronously", "id", id)
+			// Fall back to synchronous save
+			go s.saveMemoryAsync(memory)
+		}
+	} else {
+		// Synchronous save
+		fileSize, err := s.saveMemoryToFile(memory)
+		if err != nil {
+			return nil, fmt.Errorf("failed to save memory: %w", err)
+		}
+		
+		// Update storage tracking
+		s.mu.Lock()
+		oldSize := s.memorySizes[id]
+		s.totalSize = s.totalSize - oldSize + fileSize
+		s.memorySizes[id] = fileSize
+		needsCleanup := s.totalSize > s.config.MaxStorageSize
+		s.mu.Unlock()
+		
+		// Clean up if over limit
+		if needsCleanup {
+			if err := s.cleanupOldMemories(); err != nil {
+				s.logger.WithError(err).Warn("Failed to cleanup old memories")
+			}
+		}
 	}
 
 	return memory, nil
@@ -381,7 +414,12 @@ func (s *Store) ensureDirectories() error {
 }
 
 func (s *Store) saveMemoryToFile(memory *Memory) (int64, error) {
-	filename := fmt.Sprintf("%s.json.gz", memory.ID)
+	var filename string
+	if s.config.EnableCompression {
+		filename = fmt.Sprintf("%s.json.gz", memory.ID)
+	} else {
+		filename = fmt.Sprintf("%s.json", memory.ID)
+	}
 	filepath := filepath.Join(s.dataDir, "memories", filename)
 
 	data, err := json.Marshal(memory)
@@ -389,26 +427,34 @@ func (s *Store) saveMemoryToFile(memory *Memory) (int64, error) {
 		return 0, fmt.Errorf("failed to marshal memory: %w", err)
 	}
 
-	// Compress data
-	var compressed bytes.Buffer
-	gzipWriter := gzip.NewWriter(&compressed)
-	if _, err := gzipWriter.Write(data); err != nil {
-		return 0, fmt.Errorf("failed to compress data: %w", err)
+	var fileData []byte
+	if s.config.EnableCompression {
+		// Compress data
+		var compressed bytes.Buffer
+		gzipWriter, err := gzip.NewWriterLevel(&compressed, s.config.CompressionLevel)
+		if err != nil {
+			return 0, fmt.Errorf("failed to create gzip writer: %w", err)
+		}
+		if _, err := gzipWriter.Write(data); err != nil {
+			return 0, fmt.Errorf("failed to compress data: %w", err)
+		}
+		if err := gzipWriter.Close(); err != nil {
+			return 0, fmt.Errorf("failed to close gzip writer: %w", err)
+		}
+		fileData = compressed.Bytes()
+	} else {
+		// Use uncompressed data
+		fileData = data
 	}
-	if err := gzipWriter.Close(); err != nil {
-		return 0, fmt.Errorf("failed to close gzip writer: %w", err)
-	}
-
-	compressedData := compressed.Bytes()
 
 	// Check file size limit
-	if int64(len(compressedData)) > s.config.MaxFileSize {
-		return 0, fmt.Errorf("memory file size %d exceeds limit %d", len(compressedData), s.config.MaxFileSize)
+	if int64(len(fileData)) > s.config.MaxFileSize {
+		return 0, fmt.Errorf("memory file size %d exceeds limit %d", len(fileData), s.config.MaxFileSize)
 	}
 
 	// Atomic write
 	tempFile := filepath + ".tmp"
-	if err := os.WriteFile(tempFile, compressedData, 0644); err != nil {
+	if err := os.WriteFile(tempFile, fileData, 0644); err != nil {
 		return 0, fmt.Errorf("failed to write temp file: %w", err)
 	}
 
@@ -417,7 +463,7 @@ func (s *Store) saveMemoryToFile(memory *Memory) (int64, error) {
 		return 0, fmt.Errorf("failed to rename temp file: %w", err)
 	}
 
-	return int64(len(compressedData)), nil
+	return int64(len(fileData)), nil
 }
 
 func (s *Store) loadIndex() error {

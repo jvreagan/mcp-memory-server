@@ -1,0 +1,31 @@
+{
+  "mcpServers": {
+    "memory": {
+      "command": "/path/to/mcp-memory-server",
+      "args": [],
+      "env": {
+        "MCP_DATA_DIR": "/Users/username/.mcp-memory",
+        "MCP_LOG_LEVEL": "info",
+        "MCP_LOG_FORMAT": "json",
+        
+        "comment_storage": "Storage configuration",
+        "MCP_MAX_FILE_SIZE": "104857600",
+        "MCP_MAX_STORAGE_SIZE": "107374182400",
+        
+        "comment_async": "Async behavior configuration - set these for high throughput",
+        "MCP_ENABLE_ASYNC": "true",
+        "MCP_QUEUE_SIZE": "1000",
+        "MCP_WORKER_THREADS": "2",
+        
+        "comment_compression": "Compression configuration - adjust for storage vs performance",
+        "MCP_ENABLE_COMPRESSION": "true",
+        "MCP_COMPRESSION_LEVEL": "6",
+        
+        "comment_search": "Search configuration",
+        "MCP_MAX_RESULTS": "20",
+        "MCP_ENABLE_EMBEDDINGS": "false",
+        "MCP_EMBEDDING_MODEL": "text-embedding-ada-002"
+      }
+    }
+  }
+}

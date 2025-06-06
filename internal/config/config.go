@@ -2,6 +2,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,6 +21,15 @@ type StorageConfig struct {
 	DataDir        string `json:"data_dir"`
 	MaxFileSize    int64  `json:"max_file_size"`    // bytes per file
 	MaxStorageSize int64  `json:"max_storage_size"` // total storage limit in bytes
+	
+	// Async behavior configuration
+	EnableAsync   bool `json:"enable_async"`    // Enable async save operations
+	QueueSize     int  `json:"queue_size"`      // Size of async save queue
+	WorkerThreads int  `json:"worker_threads"`  // Number of worker threads for async saves
+	
+	// Compression configuration
+	EnableCompression bool   `json:"enable_compression"` // Enable gzip compression
+	CompressionLevel  int    `json:"compression_level"`  // Gzip compression level (1-9)
 }
 
 // LoggingConfig holds logging configuration
@@ -53,9 +63,14 @@ func Load() (*Config, error) {
 
 	cfg := &Config{
 		Storage: StorageConfig{
-			DataDir:        getEnvString("MCP_DATA_DIR", defaultDataDir),
-			MaxFileSize:    getEnvInt64("MCP_MAX_FILE_SIZE", 100*1024*1024),         // 100MB
-			MaxStorageSize: getEnvInt64("MCP_MAX_STORAGE_SIZE", 100*1024*1024*1024), // 100GB
+			DataDir:           getEnvString("MCP_DATA_DIR", defaultDataDir),
+			MaxFileSize:       getEnvInt64("MCP_MAX_FILE_SIZE", 100*1024*1024),         // 100MB
+			MaxStorageSize:    getEnvInt64("MCP_MAX_STORAGE_SIZE", 100*1024*1024*1024), // 100GB
+			EnableAsync:       getEnvBool("MCP_ENABLE_ASYNC", true),                    // Async enabled by default
+			QueueSize:         getEnvInt("MCP_QUEUE_SIZE", 1000),                       // Default queue size
+			WorkerThreads:     getEnvInt("MCP_WORKER_THREADS", 2),                      // Default 2 workers
+			EnableCompression: getEnvBool("MCP_ENABLE_COMPRESSION", true),              // Compression enabled by default
+			CompressionLevel:  getEnvInt("MCP_COMPRESSION_LEVEL", 6),                   // Default gzip level (1-9, 6 is balanced)
 		},
 		Logging: LoggingConfig{
 			Level:  getEnvString("MCP_LOG_LEVEL", "info"),
@@ -73,7 +88,47 @@ func Load() (*Config, error) {
 		},
 	}
 
+	// Validate configuration
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+// Validate validates the configuration values
+func (c *Config) Validate() error {
+	// Validate compression level
+	if c.Storage.EnableCompression {
+		if c.Storage.CompressionLevel < 1 || c.Storage.CompressionLevel > 9 {
+			return fmt.Errorf("compression level must be between 1 and 9, got %d", c.Storage.CompressionLevel)
+		}
+	}
+	
+	// Validate queue size
+	if c.Storage.EnableAsync && c.Storage.QueueSize < 1 {
+		return fmt.Errorf("queue size must be at least 1 when async is enabled, got %d", c.Storage.QueueSize)
+	}
+	
+	// Validate worker threads
+	if c.Storage.EnableAsync && c.Storage.WorkerThreads < 1 {
+		return fmt.Errorf("worker threads must be at least 1 when async is enabled, got %d", c.Storage.WorkerThreads)
+	}
+	
+	// Validate storage limits
+	if c.Storage.MaxFileSize <= 0 {
+		return fmt.Errorf("max file size must be positive, got %d", c.Storage.MaxFileSize)
+	}
+	
+	if c.Storage.MaxStorageSize <= 0 {
+		return fmt.Errorf("max storage size must be positive, got %d", c.Storage.MaxStorageSize)
+	}
+	
+	if c.Storage.MaxFileSize > c.Storage.MaxStorageSize {
+		return fmt.Errorf("max file size (%d) cannot exceed max storage size (%d)", c.Storage.MaxFileSize, c.Storage.MaxStorageSize)
+	}
+	
+	return nil
 }
 
 // Helper functions for environment variable parsing
