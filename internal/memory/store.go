@@ -54,6 +54,8 @@ type Store struct {
 	totalSize     int64               // total storage size in bytes
 	memorySizes   map[string]int64    // memory ID -> file size
 	saveQueue     chan *Memory        // async save queue
+	wg            sync.WaitGroup      // wait group for worker goroutines
+	shutdownCh    chan struct{}       // shutdown signal channel
 }
 
 // NewStore creates a new memory store
@@ -67,11 +69,13 @@ func NewStore(dataDir string, cfg *config.StorageConfig, log *logger.Logger) (*S
 		tagIndex:      make(map[string][]string),
 		memorySizes:   make(map[string]int64),
 		saveQueue:     make(chan *Memory, cfg.QueueSize), // Configurable queue size
+		shutdownCh:    make(chan struct{}),
 	}
 
 	// Start async save workers if enabled
 	if cfg.EnableAsync {
 		for i := 0; i < cfg.WorkerThreads; i++ {
+			store.wg.Add(1)
 			go store.saveWorker()
 		}
 	}
@@ -138,15 +142,25 @@ func (s *Store) Store(content, summary, category string, tags []string, metadata
 	// Save to file based on async configuration
 	if s.config.EnableAsync {
 		// Queue for async file save (slow operations in background)
-		select {
-		case s.saveQueue <- memory:
-			// Successfully queued
-		default:
-			// Queue is full, log warning but don't block
-			s.logger.Warn("Save queue full, memory will be saved synchronously", "id", id)
-			// Fall back to synchronous save
-			go s.saveMemoryAsync(memory)
-		}
+		// Use a goroutine to handle potential channel closure during shutdown
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					s.logger.Warn("Save queue closed during shutdown, saving synchronously", "id", id)
+					s.saveMemoryAsync(memory)
+				}
+			}()
+			
+			select {
+			case s.saveQueue <- memory:
+				// Successfully queued
+			default:
+				// Queue is full, log warning but don't block
+				s.logger.Warn("Save queue full, memory will be saved synchronously", "id", id)
+				// Save synchronously in current goroutine
+				s.saveMemoryAsync(memory)
+			}
+		}()
 	} else {
 		// Synchronous save
 		fileSize, err := s.saveMemoryToFile(memory)
@@ -361,6 +375,50 @@ func (s *Store) Delete(id string) error {
 	delete(s.index, id)
 
 	s.logger.Info("Memory deleted", "id", id)
+	return nil
+}
+
+// Close gracefully shuts down the store
+func (s *Store) Close() error {
+	s.logger.Info("Closing memory store")
+	
+	// Only proceed with shutdown if async is enabled
+	if !s.config.EnableAsync {
+		s.logger.Info("Memory store closed (sync mode)")
+		return nil
+	}
+	
+	// Signal workers to start shutdown
+	close(s.shutdownCh)
+	
+	// Wait a moment for workers to start draining
+	time.Sleep(100 * time.Millisecond)
+	
+	// Close the save queue to prevent new saves
+	close(s.saveQueue)
+	
+	// Log queue status
+	queueLen := len(s.saveQueue)
+	if queueLen > 0 {
+		s.logger.Info("Waiting for pending saves to complete", "pending_saves", queueLen)
+	}
+	
+	// Wait for all workers to finish with timeout
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	
+	select {
+	case <-done:
+		s.logger.Info("All save workers completed successfully")
+	case <-time.After(30 * time.Second):
+		s.logger.Warn("Timeout waiting for save workers to complete")
+		return fmt.Errorf("timeout waiting for workers to complete")
+	}
+	
+	s.logger.Info("Memory store closed successfully")
 	return nil
 }
 
@@ -827,8 +885,35 @@ func (s *ReadOnlyStore) List(category string, tags []string, limit int) ([]*Memo
 
 // saveWorker processes the async save queue
 func (s *Store) saveWorker() {
-	for memory := range s.saveQueue {
-		s.saveMemoryAsync(memory)
+	defer s.wg.Done()
+	
+	for {
+		select {
+		case memory, ok := <-s.saveQueue:
+			if !ok {
+				// Channel closed, worker should exit
+				s.logger.Debug("Save worker exiting - queue closed")
+				return
+			}
+			s.saveMemoryAsync(memory)
+		case <-s.shutdownCh:
+			// Shutdown signal received, drain the queue
+			s.logger.Debug("Save worker received shutdown signal, draining queue")
+			for {
+				select {
+				case memory, ok := <-s.saveQueue:
+					if !ok {
+						s.logger.Debug("Save worker exiting - queue drained")
+						return
+					}
+					s.saveMemoryAsync(memory)
+				default:
+					// Queue is empty
+					s.logger.Debug("Save worker exiting - queue empty")
+					return
+				}
+			}
+		}
 	}
 }
 

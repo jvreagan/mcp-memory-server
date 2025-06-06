@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"mcp-memory-server/internal/config"
 	"mcp-memory-server/internal/mcp"
@@ -42,16 +43,36 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
+	// Channel to signal when shutdown is complete
+	shutdownComplete := make(chan struct{})
+
 	go func() {
 		<-sigChan
 		logger.Info("Shutdown signal received")
+		
+		// Cancel the context to stop the MCP server
 		cancel()
+		
+		// Close the memory store to ensure all pending saves complete
+		if err := memoryStore.Close(); err != nil {
+			logger.WithError(err).Error("Error closing memory store")
+		}
+		
+		close(shutdownComplete)
 	}()
 
 	// Start MCP server
 	logger.Info("MCP Memory Server ready", "data_dir", cfg.Storage.DataDir)
 	if err := mcpServer.Run(ctx); err != nil {
 		logger.WithError(err).Fatal("MCP server failed")
+	}
+
+	// Wait for shutdown to complete
+	select {
+	case <-shutdownComplete:
+		logger.Info("Shutdown complete")
+	case <-time.After(35 * time.Second):
+		logger.Error("Shutdown timeout - forcing exit")
 	}
 
 	logger.Info("MCP Memory Server stopped")
