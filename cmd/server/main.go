@@ -26,7 +26,7 @@ func main() {
 	logger.Info("Starting MCP Memory Server", "version", "1.0.0")
 
 	// Initialize memory store
-	memoryStore, err := memory.NewStore(cfg.Storage.DataDir, logger)
+	memoryStore, err := memory.NewStore(cfg.Storage.DataDir, &cfg.Storage, logger)
 	if err != nil {
 		logger.WithError(err).Fatal("Failed to initialize memory store")
 	}

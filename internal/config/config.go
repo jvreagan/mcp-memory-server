@@ -4,6 +4,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 // Config holds all application configuration
@@ -11,12 +12,14 @@ type Config struct {
 	Storage StorageConfig `json:"storage"`
 	Logging LoggingConfig `json:"logging"`
 	Search  SearchConfig  `json:"search"`
+	Web     WebConfig     `json:"web"`
 }
 
 // StorageConfig holds data storage configuration
 type StorageConfig struct {
-	DataDir     string `json:"data_dir"`
-	MaxFileSize int64  `json:"max_file_size"` // bytes
+	DataDir        string `json:"data_dir"`
+	MaxFileSize    int64  `json:"max_file_size"`    // bytes per file
+	MaxStorageSize int64  `json:"max_storage_size"` // total storage limit in bytes
 }
 
 // LoggingConfig holds logging configuration
@@ -32,6 +35,13 @@ type SearchConfig struct {
 	MaxResults       int    `json:"max_results"`
 }
 
+// WebConfig holds web server configuration
+type WebConfig struct {
+	Enabled bool   `json:"enabled"`
+	Port    int    `json:"port"`
+	Host    string `json:"host"`
+}
+
 // Load loads configuration from environment variables with sensible defaults
 func Load() (*Config, error) {
 	homeDir, err := os.UserHomeDir()
@@ -43,8 +53,9 @@ func Load() (*Config, error) {
 
 	cfg := &Config{
 		Storage: StorageConfig{
-			DataDir:     getEnvString("MCP_DATA_DIR", defaultDataDir),
-			MaxFileSize: getEnvInt64("MCP_MAX_FILE_SIZE", 100*1024*1024), // 100MB
+			DataDir:        getEnvString("MCP_DATA_DIR", defaultDataDir),
+			MaxFileSize:    getEnvInt64("MCP_MAX_FILE_SIZE", 100*1024*1024),         // 100MB
+			MaxStorageSize: getEnvInt64("MCP_MAX_STORAGE_SIZE", 100*1024*1024*1024), // 100GB
 		},
 		Logging: LoggingConfig{
 			Level:  getEnvString("MCP_LOG_LEVEL", "info"),
@@ -54,6 +65,11 @@ func Load() (*Config, error) {
 			EnableEmbeddings: getEnvBool("MCP_ENABLE_EMBEDDINGS", false),
 			EmbeddingModel:   getEnvString("MCP_EMBEDDING_MODEL", "text-embedding-ada-002"),
 			MaxResults:       getEnvInt("MCP_MAX_RESULTS", 20),
+		},
+		Web: WebConfig{
+			Enabled: getEnvBool("MCP_WEB_ENABLED", true),
+			Port:    getEnvInt("MCP_WEB_PORT", 9000),
+			Host:    getEnvString("MCP_WEB_HOST", "localhost"),
 		},
 	}
 
@@ -70,15 +86,18 @@ func getEnvString(key, defaultValue string) string {
 
 func getEnvInt(key string, defaultValue int) int {
 	if str := os.Getenv(key); str != "" {
-		// Simple int parsing - could be enhanced
-		return defaultValue // For now, return default
+		if val, err := strconv.Atoi(str); err == nil {
+			return val
+		}
 	}
 	return defaultValue
 }
 
 func getEnvInt64(key string, defaultValue int64) int64 {
 	if str := os.Getenv(key); str != "" {
-		return defaultValue // For now, return default
+		if val, err := strconv.ParseInt(str, 10, 64); err == nil {
+			return val
+		}
 	}
 	return defaultValue
 }
