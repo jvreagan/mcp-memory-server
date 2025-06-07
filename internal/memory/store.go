@@ -18,6 +18,7 @@ import (
 
 	"mcp-memory-server/internal/config"
 	"mcp-memory-server/pkg/crypto"
+	"mcp-memory-server/pkg/keywords"
 	"mcp-memory-server/pkg/logger"
 )
 
@@ -27,6 +28,7 @@ type Memory struct {
 	Content           string            `json:"content"`
 	Summary           string            `json:"summary,omitempty"`
 	Tags              []string          `json:"tags,omitempty"`
+	Keywords          []string          `json:"keywords,omitempty"`
 	Category          string            `json:"category,omitempty"`
 	Metadata          map[string]string `json:"metadata,omitempty"`
 	CreatedAt         time.Time         `json:"created_at"`
@@ -64,6 +66,7 @@ type Store struct {
 	index          map[string]*Memory  // In-memory index for fast access
 	categoryIndex  map[string][]string // category -> memory IDs
 	tagIndex       map[string][]string // tag -> memory IDs
+	keywordIndex   map[string][]string // keyword -> memory IDs
 	totalSize      int64               // total storage size in bytes
 	memorySizes    map[string]int64    // memory ID -> file size
 	saveQueue      chan *Memory        // async save queue
@@ -82,6 +85,7 @@ func NewStore(dataDir string, cfg *config.StorageConfig, log *logger.Logger) (*S
 		index:         make(map[string]*Memory),
 		categoryIndex: make(map[string][]string),
 		tagIndex:      make(map[string][]string),
+		keywordIndex:  make(map[string][]string),
 		memorySizes:   make(map[string]int64),
 		saveQueue:     make(chan *Memory, cfg.QueueSize), // Configurable queue size
 		shutdownCh:    make(chan struct{}),
@@ -136,6 +140,20 @@ func (s *Store) Store(content, summary, category string, tags []string, metadata
 	// Generate base ID from content hash
 	baseID := s.generateID(content)
 	now := time.Now()
+	
+	// Extract keywords from content and summary
+	extractor := keywords.NewExtractor()
+	textToAnalyze := content
+	if summary != "" {
+		textToAnalyze = textToAnalyze + " " + summary
+	}
+	extractedKeywords := extractor.Extract(textToAnalyze, 15) // Extract up to 15 keywords
+	
+	// Convert keywords to string slice
+	keywordList := make([]string, 0, len(extractedKeywords))
+	for _, kw := range extractedKeywords {
+		keywordList = append(keywordList, kw.Term)
+	}
 
 	s.mu.Lock()
 	// Check if memory already exists
@@ -179,6 +197,7 @@ func (s *Store) Store(content, summary, category string, tags []string, metadata
 		Content:           content,
 		Summary:           summary,
 		Tags:              tags,
+		Keywords:          keywordList,
 		Category:          category,
 		Metadata:          metadata,
 		CreatedAt:         now,
@@ -318,6 +337,36 @@ func (s *Store) Search(query *SearchQuery) ([]*Memory, error) {
 			candidateIDs = tagCandidates
 		}
 	}
+	
+	// Check if query terms match any keywords for faster lookup
+	queryWords := strings.Fields(queryLower)
+	keywordCandidates := make(map[string]bool)
+	for _, word := range queryWords {
+		// Check exact keyword matches
+		for _, id := range s.keywordIndex[word] {
+			keywordCandidates[id] = true
+		}
+		// Check partial keyword matches
+		for keyword, ids := range s.keywordIndex {
+			if strings.Contains(keyword, word) || strings.Contains(word, keyword) {
+				for _, id := range ids {
+					keywordCandidates[id] = true
+				}
+			}
+		}
+	}
+	
+	// If we have keyword matches, include them in candidates
+	if len(keywordCandidates) > 0 {
+		if candidateIDs != nil {
+			// Union with existing candidates
+			for id := range keywordCandidates {
+				candidateIDs[id] = true
+			}
+		} else {
+			candidateIDs = keywordCandidates
+		}
+	}
 
 	// Search through candidates or all memories
 	for id, memory := range s.index {
@@ -415,6 +464,86 @@ func (s *Store) List(category string, tags []string, limit int) ([]*Memory, erro
 	}
 
 	return results, nil
+}
+
+// GetByKeyword retrieves memories that contain a specific keyword
+func (s *Store) GetByKeyword(keyword string, limit int) ([]*Memory, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	
+	keywordLower := strings.ToLower(keyword)
+	memoryIDs := s.keywordIndex[keywordLower]
+	
+	if len(memoryIDs) == 0 {
+		return []*Memory{}, nil
+	}
+	
+	var memories []*Memory
+	for _, id := range memoryIDs {
+		if memory, exists := s.index[id]; exists && memory.IsCurrentVersion {
+			memories = append(memories, memory)
+		}
+	}
+	
+	// Sort by creation time (newest first)
+	sort.Slice(memories, func(i, j int) bool {
+		return memories[i].CreatedAt.After(memories[j].CreatedAt)
+	})
+	
+	if limit > 0 && len(memories) > limit {
+		memories = memories[:limit]
+	}
+	
+	return memories, nil
+}
+
+// GetTopKeywords returns the most frequently used keywords
+func (s *Store) GetTopKeywords(limit int) []struct {
+	Keyword string
+	Count   int
+} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	
+	type keywordCount struct {
+		keyword string
+		count   int
+	}
+	
+	var counts []keywordCount
+	for keyword, ids := range s.keywordIndex {
+		// Count only current versions
+		currentCount := 0
+		for _, id := range ids {
+			if memory, exists := s.index[id]; exists && memory.IsCurrentVersion {
+				currentCount++
+			}
+		}
+		if currentCount > 0 {
+			counts = append(counts, keywordCount{keyword: keyword, count: currentCount})
+		}
+	}
+	
+	// Sort by count
+	sort.Slice(counts, func(i, j int) bool {
+		return counts[i].count > counts[j].count
+	})
+	
+	if limit > 0 && len(counts) > limit {
+		counts = counts[:limit]
+	}
+	
+	result := make([]struct {
+		Keyword string
+		Count   int
+	}, len(counts))
+	
+	for i, kc := range counts {
+		result[i].Keyword = kc.keyword
+		result[i].Count = kc.count
+	}
+	
+	return result
 }
 
 // GetHistory retrieves all versions of a memory
@@ -707,13 +836,19 @@ func (s *Store) GetStats() map[string]interface{} {
 
 	categories := make(map[string]int)
 	totalAccess := 0
+	totalKeywords := 0
+	uniqueKeywords := len(s.keywordIndex)
 
 	for _, memory := range s.index {
 		if memory.Category != "" {
 			categories[memory.Category]++
 		}
 		totalAccess += memory.AccessCount
+		totalKeywords += len(memory.Keywords)
 	}
+	
+	// Get top 10 keywords
+	topKeywords := s.GetTopKeywords(10)
 
 	return map[string]interface{}{
 		"total_memories":     len(s.index),
@@ -723,6 +858,9 @@ func (s *Store) GetStats() map[string]interface{} {
 		"total_size":         s.totalSize,
 		"max_storage_size":   s.config.MaxStorageSize,
 		"storage_used_pct":   float64(s.totalSize) / float64(s.config.MaxStorageSize) * 100,
+		"total_keywords":     totalKeywords,
+		"unique_keywords":    uniqueKeywords,
+		"top_keywords":       topKeywords,
 	}
 }
 
@@ -930,6 +1068,18 @@ func (s *Store) calculateRelevanceScore(memory *Memory, query *SearchQuery, quer
 	if memory.Summary != "" && strings.Contains(strings.ToLower(memory.Summary), queryLower) {
 		score += 0.8
 	}
+	
+	// Keyword matching (high boost)
+	queryWords := strings.Fields(queryLower)
+	for _, keyword := range memory.Keywords {
+		keywordLower := strings.ToLower(keyword)
+		for _, queryWord := range queryWords {
+			if strings.Contains(keywordLower, queryWord) || strings.Contains(queryWord, keywordLower) {
+				score += 1.5 // High boost for keyword matches
+				break
+			}
+		}
+	}
 
 	// Category matching
 	if query.Category != "" && memory.Category == query.Category {
@@ -960,7 +1110,7 @@ func (s *Store) hasAnyTag(memoryTags, queryTags []string) bool {
 	return false
 }
 
-// updateIndices adds memory to category and tag indices
+// updateIndices adds memory to category, tag and keyword indices
 func (s *Store) updateIndices(memory *Memory) {
 	// Update category index
 	if memory.Category != "" {
@@ -991,9 +1141,24 @@ func (s *Store) updateIndices(memory *Memory) {
 			s.tagIndex[tagKey] = append(s.tagIndex[tagKey], memory.ID)
 		}
 	}
+	
+	// Update keyword index
+	for _, keyword := range memory.Keywords {
+		keywordKey := strings.ToLower(keyword)
+		found := false
+		for _, id := range s.keywordIndex[keywordKey] {
+			if id == memory.ID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			s.keywordIndex[keywordKey] = append(s.keywordIndex[keywordKey], memory.ID)
+		}
+	}
 }
 
-// removeFromIndices removes memory from category and tag indices
+// removeFromIndices removes memory from category, tag and keyword indices
 func (s *Store) removeFromIndices(memory *Memory) {
 	// Remove from category index
 	if memory.Category != "" {
@@ -1022,6 +1187,21 @@ func (s *Store) removeFromIndices(memory *Memory) {
 		}
 		if len(s.tagIndex[tagKey]) == 0 {
 			delete(s.tagIndex, tagKey)
+		}
+	}
+	
+	// Remove from keyword index
+	for _, keyword := range memory.Keywords {
+		keywordKey := strings.ToLower(keyword)
+		ids := s.keywordIndex[keywordKey]
+		for i, id := range ids {
+			if id == memory.ID {
+				s.keywordIndex[keywordKey] = append(ids[:i], ids[i+1:]...)
+				break
+			}
+		}
+		if len(s.keywordIndex[keywordKey]) == 0 {
+			delete(s.keywordIndex, keywordKey)
 		}
 	}
 }
