@@ -21,7 +21,7 @@ run-server: ## Run the MCP server locally
 	./mcp-memory-server
 
 run-reporter: ## Run the reporting server locally  
-	./mcp-memory-reporter
+	MCP_ENABLE_ENCRYPTION=true MCP_ENCRYPTION_KEY_PATH=$(HOME)/.mcp-memory/encryption.key ./mcp-memory-reporter
 
 # Docker commands
 docker-build: ## Build Docker containers
