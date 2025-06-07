@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"mcp-memory-server/internal/memory"
 	"mcp-memory-server/pkg/logger"
@@ -236,6 +237,38 @@ func (s *Server) handleToolsList(req MCPRequest) error {
 				"properties": map[string]interface{}{},
 			},
 		},
+		{
+			"name":        "bulk_delete",
+			"description": "Delete multiple memories based on filters. Requires at least one filter and confirmation.",
+			"inputSchema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"category": map[string]interface{}{
+						"type":        "string",
+						"description": "Delete memories in this category",
+					},
+					"tags": map[string]interface{}{
+						"type":        "array",
+						"items":       map[string]interface{}{"type": "string"},
+						"description": "Delete memories with any of these tags",
+					},
+					"before_date": map[string]interface{}{
+						"type":        "string",
+						"format":      "date-time",
+						"description": "Delete memories created before this date (ISO 8601 format)",
+					},
+					"query": map[string]interface{}{
+						"type":        "string",
+						"description": "Delete memories containing this text in content or summary",
+					},
+					"confirm": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Must be true to execute deletion",
+					},
+				},
+				"required": []string{"confirm"},
+			},
+		},
 	}
 
 	result := map[string]interface{}{
@@ -278,6 +311,8 @@ func (s *Server) handleToolsCall(req MCPRequest) error {
 		result, err = s.handleListMemories(arguments)
 	case "memory_stats":
 		result, err = s.handleMemoryStats(arguments)
+	case "bulk_delete":
+		result, err = s.handleBulkDelete(arguments)
 	default:
 		return s.sendError(req.ID, -32602, "Unknown tool", toolName)
 	}
@@ -462,6 +497,82 @@ func (s *Server) handleMemoryStats(args map[string]interface{}) (string, error) 
 		for category, count := range categories {
 			result.WriteString(fmt.Sprintf("- %s: %d\n", category, count))
 		}
+	}
+
+	return result.String(), nil
+}
+
+func (s *Server) handleBulkDelete(args map[string]interface{}) (string, error) {
+	// Parse confirmation flag
+	confirm, ok := args["confirm"].(bool)
+	if !ok || !confirm {
+		return "", fmt.Errorf("confirmation required: set confirm to true to execute bulk deletion")
+	}
+
+	// Create BulkDeleteOptions from arguments
+	options := &memory.BulkDeleteOptions{
+		Confirm: confirm,
+	}
+
+	// Parse optional filters
+	if category, ok := args["category"].(string); ok {
+		options.Category = category
+	}
+
+	if tagsInterface, ok := args["tags"].([]interface{}); ok {
+		for _, tag := range tagsInterface {
+			if tagStr, ok := tag.(string); ok {
+				options.Tags = append(options.Tags, tagStr)
+			}
+		}
+	}
+
+	if beforeDateStr, ok := args["before_date"].(string); ok && beforeDateStr != "" {
+		// Parse ISO 8601 date
+		beforeDate, err := time.Parse(time.RFC3339, beforeDateStr)
+		if err != nil {
+			// Try other common formats
+			beforeDate, err = time.Parse("2006-01-02", beforeDateStr)
+			if err != nil {
+				return "", fmt.Errorf("invalid date format for before_date: %s (use ISO 8601 format)", beforeDateStr)
+			}
+		}
+		options.BeforeDate = beforeDate
+	}
+
+	if query, ok := args["query"].(string); ok {
+		options.Query = query
+	}
+
+	// Execute bulk delete
+	deletedCount, err := s.store.BulkDelete(options)
+	if err != nil {
+		return "", fmt.Errorf("bulk delete failed: %w", err)
+	}
+
+	// Build result message
+	var result strings.Builder
+	result.WriteString(fmt.Sprintf("## Bulk Delete Completed\n\n"))
+	result.WriteString(fmt.Sprintf("**Deleted:** %d memories\n\n", deletedCount))
+	
+	result.WriteString("**Filters Applied:**\n")
+	if options.Category != "" {
+		result.WriteString(fmt.Sprintf("- Category: %s\n", options.Category))
+	}
+	if len(options.Tags) > 0 {
+		result.WriteString(fmt.Sprintf("- Tags: %s\n", strings.Join(options.Tags, ", ")))
+	}
+	if !options.BeforeDate.IsZero() {
+		result.WriteString(fmt.Sprintf("- Before Date: %s\n", options.BeforeDate.Format("2006-01-02")))
+	}
+	if options.Query != "" {
+		result.WriteString(fmt.Sprintf("- Query: %s\n", options.Query))
+	}
+
+	if deletedCount == 0 {
+		result.WriteString("\nNo memories matched the specified filters.")
+	} else {
+		result.WriteString(fmt.Sprintf("\nAll %d matching memories and their versions have been permanently deleted.", deletedCount))
 	}
 
 	return result.String(), nil

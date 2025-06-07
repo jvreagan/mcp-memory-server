@@ -43,8 +43,8 @@ func main() {
 		"data_dir", memoryDataDir,
 		"port", *port)
 
-	// Initialize read-only memory store
-	memoryStore, err := memory.NewReadOnlyStore(memoryDataDir, logger)
+	// Initialize read-only memory store with encryption config if enabled
+	memoryStore, err := memory.NewReadOnlyStoreWithConfig(memoryDataDir, &cfg.Storage, logger)
 	if err != nil {
 		logger.WithError(err).Fatal("Failed to initialize read-only memory store")
 	}

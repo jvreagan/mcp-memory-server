@@ -30,6 +30,10 @@ type StorageConfig struct {
 	// Compression configuration
 	EnableCompression bool   `json:"enable_compression"` // Enable gzip compression
 	CompressionLevel  int    `json:"compression_level"`  // Gzip compression level (1-9)
+	
+	// Encryption configuration
+	EnableEncryption  bool   `json:"enable_encryption"`  // Enable AES-256-GCM encryption
+	EncryptionKeyPath string `json:"encryption_key_path"` // Path to encryption key file
 }
 
 // LoggingConfig holds logging configuration
@@ -71,6 +75,8 @@ func Load() (*Config, error) {
 			WorkerThreads:     getEnvInt("MCP_WORKER_THREADS", 2),                      // Default 2 workers
 			EnableCompression: getEnvBool("MCP_ENABLE_COMPRESSION", true),              // Compression enabled by default
 			CompressionLevel:  getEnvInt("MCP_COMPRESSION_LEVEL", 6),                   // Default gzip level (1-9, 6 is balanced)
+			EnableEncryption:  getEnvBool("MCP_ENABLE_ENCRYPTION", false),              // Encryption disabled by default
+			EncryptionKeyPath: getEnvString("MCP_ENCRYPTION_KEY_PATH", filepath.Join(homeDir, ".mcp-memory", "encryption.key")),
 		},
 		Logging: LoggingConfig{
 			Level:  getEnvString("MCP_LOG_LEVEL", "info"),
@@ -103,6 +109,11 @@ func (c *Config) Validate() error {
 		if c.Storage.CompressionLevel < 1 || c.Storage.CompressionLevel > 9 {
 			return fmt.Errorf("compression level must be between 1 and 9, got %d", c.Storage.CompressionLevel)
 		}
+	}
+	
+	// Validate encryption configuration
+	if c.Storage.EnableEncryption && c.Storage.EncryptionKeyPath == "" {
+		return fmt.Errorf("encryption key path must be specified when encryption is enabled")
 	}
 	
 	// Validate queue size

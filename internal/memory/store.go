@@ -17,21 +17,25 @@ import (
 	"time"
 
 	"mcp-memory-server/internal/config"
+	"mcp-memory-server/pkg/crypto"
 	"mcp-memory-server/pkg/logger"
 )
 
 // Memory represents a stored memory item
 type Memory struct {
-	ID          string            `json:"id"`
-	Content     string            `json:"content"`
-	Summary     string            `json:"summary,omitempty"`
-	Tags        []string          `json:"tags,omitempty"`
-	Category    string            `json:"category,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	CreatedAt   time.Time         `json:"created_at"`
-	UpdatedAt   time.Time         `json:"updated_at"`
-	AccessCount int               `json:"access_count"`
-	LastAccess  time.Time         `json:"last_access"`
+	ID                string            `json:"id"`
+	Content           string            `json:"content"`
+	Summary           string            `json:"summary,omitempty"`
+	Tags              []string          `json:"tags,omitempty"`
+	Category          string            `json:"category,omitempty"`
+	Metadata          map[string]string `json:"metadata,omitempty"`
+	CreatedAt         time.Time         `json:"created_at"`
+	UpdatedAt         time.Time         `json:"updated_at"`
+	AccessCount       int               `json:"access_count"`
+	LastAccess        time.Time         `json:"last_access"`
+	Version           int               `json:"version"`
+	PreviousVersionID string            `json:"previous_version_id,omitempty"`
+	IsCurrentVersion  bool              `json:"is_current_version"`
 }
 
 // SearchQuery represents a search request
@@ -42,20 +46,31 @@ type SearchQuery struct {
 	Limit    int      `json:"limit,omitempty"`
 }
 
+// BulkDeleteOptions represents options for bulk memory deletion
+type BulkDeleteOptions struct {
+	Category   string    `json:"category,omitempty"`    // Filter by category
+	Tags       []string  `json:"tags,omitempty"`        // Filter by tags (memories must have at least one matching tag)
+	BeforeDate time.Time `json:"before_date,omitempty"` // Delete memories created before this date
+	Query      string    `json:"query,omitempty"`       // Filter by content/summary containing this text
+	Confirm    bool      `json:"confirm"`               // Must be true to execute deletion
+}
+
 // Store manages memory storage and retrieval
 type Store struct {
 	dataDir       string
 	config        *config.StorageConfig
 	logger        *logger.Logger
 	mu            sync.RWMutex
-	index         map[string]*Memory  // In-memory index for fast access
-	categoryIndex map[string][]string // category -> memory IDs
-	tagIndex      map[string][]string // tag -> memory IDs
-	totalSize     int64               // total storage size in bytes
-	memorySizes   map[string]int64    // memory ID -> file size
-	saveQueue     chan *Memory        // async save queue
-	wg            sync.WaitGroup      // wait group for worker goroutines
-	shutdownCh    chan struct{}       // shutdown signal channel
+	index          map[string]*Memory  // In-memory index for fast access
+	categoryIndex  map[string][]string // category -> memory IDs
+	tagIndex       map[string][]string // tag -> memory IDs
+	totalSize      int64               // total storage size in bytes
+	memorySizes    map[string]int64    // memory ID -> file size
+	saveQueue      chan *Memory        // async save queue
+	wg             sync.WaitGroup      // wait group for worker goroutines
+	shutdownCh     chan struct{}       // shutdown signal channel
+	versionIndex   map[string][]string // base ID -> version IDs (ordered by version number)
+	crypto         *crypto.Crypto      // encryption handler
 }
 
 // NewStore creates a new memory store
@@ -70,6 +85,17 @@ func NewStore(dataDir string, cfg *config.StorageConfig, log *logger.Logger) (*S
 		memorySizes:   make(map[string]int64),
 		saveQueue:     make(chan *Memory, cfg.QueueSize), // Configurable queue size
 		shutdownCh:    make(chan struct{}),
+		versionIndex:  make(map[string][]string),
+	}
+
+	// Initialize encryption if enabled
+	if cfg.EnableEncryption {
+		cryptoHandler, err := crypto.New(cfg.EncryptionKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize encryption: %w", err)
+		}
+		store.crypto = cryptoHandler
+		log.Info("Encryption enabled", "key_path", cfg.EncryptionKeyPath)
 	}
 
 	// Start async save workers if enabled
@@ -99,43 +125,85 @@ func NewStore(dataDir string, cfg *config.StorageConfig, log *logger.Logger) (*S
 		"worker_threads", cfg.WorkerThreads,
 		"queue_size", cfg.QueueSize,
 		"compression_enabled", cfg.EnableCompression,
-		"compression_level", cfg.CompressionLevel)
+		"compression_level", cfg.CompressionLevel,
+		"encryption_enabled", cfg.EnableEncryption)
 
 	return store, nil
 }
 
 // Store saves a memory (fast synchronous path)
 func (s *Store) Store(content, summary, category string, tags []string, metadata map[string]string) (*Memory, error) {
-	// Generate ID from content hash
-	id := s.generateID(content)
+	// Generate base ID from content hash
+	baseID := s.generateID(content)
 	now := time.Now()
 
-	memory := &Memory{
-		ID:          id,
-		Content:     content,
-		Summary:     summary,
-		Tags:        tags,
-		Category:    category,
-		Metadata:    metadata,
-		CreatedAt:   now,
-		UpdatedAt:   now,
-		AccessCount: 0,
-		LastAccess:  now,
-	}
-
-	// Fast synchronous update of in-memory index
 	s.mu.Lock()
 	// Check if memory already exists
-	if existing, exists := s.index[id]; exists {
-		memory.CreatedAt = existing.CreatedAt
-		memory.AccessCount = existing.AccessCount
-		s.logger.Debug("Updating existing memory", "id", id)
+	var previousVersionID string
+	var version int = 1
+	
+	// Find the current version if it exists
+	if existing, exists := s.index[baseID]; exists && existing.IsCurrentVersion {
+		// Mark the existing version as not current
+		existing.IsCurrentVersion = false
+		previousVersionID = existing.ID
+		version = existing.Version + 1
+		
+		// Save the updated existing memory (mark as not current)
+		if s.config.EnableAsync {
+			go func(mem *Memory) {
+				defer func() {
+					if r := recover(); r != nil {
+						s.logger.Warn("Save queue closed during shutdown, saving synchronously", "id", mem.ID)
+						s.saveMemoryAsync(mem)
+					}
+				}()
+				
+				select {
+				case s.saveQueue <- mem:
+				default:
+					s.logger.Warn("Save queue full, memory will be saved synchronously", "id", mem.ID)
+					s.saveMemoryAsync(mem)
+				}
+			}(existing)
+		} else {
+			s.saveMemoryToFile(existing)
+		}
+	}
+	
+	// Create versioned ID: baseID-vN
+	versionedID := fmt.Sprintf("%s-v%d", baseID, version)
+	
+	memory := &Memory{
+		ID:                versionedID,
+		Content:           content,
+		Summary:           summary,
+		Tags:              tags,
+		Category:          category,
+		Metadata:          metadata,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+		AccessCount:       0,
+		LastAccess:        now,
+		Version:           version,
+		PreviousVersionID: previousVersionID,
+		IsCurrentVersion:  true,
+	}
+	
+	if version == 1 {
+		s.logger.Debug("Storing new memory", "id", versionedID, "category", category)
 	} else {
-		s.logger.Debug("Storing new memory", "id", id, "category", category)
+		s.logger.Debug("Creating new version of memory", "id", versionedID, "version", version, "previous", previousVersionID)
 	}
 
 	// Update in-memory index immediately (fast)
-	s.index[id] = memory
+	s.index[versionedID] = memory
+	// Also update the base ID to point to the current version
+	s.index[baseID] = memory
+	
+	// Update version index
+	s.versionIndex[baseID] = append(s.versionIndex[baseID], versionedID)
+	
 	s.updateIndices(memory)
 	s.mu.Unlock()
 
@@ -146,7 +214,7 @@ func (s *Store) Store(content, summary, category string, tags []string, metadata
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					s.logger.Warn("Save queue closed during shutdown, saving synchronously", "id", id)
+					s.logger.Warn("Save queue closed during shutdown, saving synchronously", "id", memory.ID)
 					s.saveMemoryAsync(memory)
 				}
 			}()
@@ -156,7 +224,7 @@ func (s *Store) Store(content, summary, category string, tags []string, metadata
 				// Successfully queued
 			default:
 				// Queue is full, log warning but don't block
-				s.logger.Warn("Save queue full, memory will be saved synchronously", "id", id)
+				s.logger.Warn("Save queue full, memory will be saved synchronously", "id", memory.ID)
 				// Save synchronously in current goroutine
 				s.saveMemoryAsync(memory)
 			}
@@ -170,9 +238,9 @@ func (s *Store) Store(content, summary, category string, tags []string, metadata
 		
 		// Update storage tracking
 		s.mu.Lock()
-		oldSize := s.memorySizes[id]
+		oldSize := s.memorySizes[memory.ID]
 		s.totalSize = s.totalSize - oldSize + fileSize
-		s.memorySizes[id] = fileSize
+		s.memorySizes[memory.ID] = fileSize
 		needsCleanup := s.totalSize > s.config.MaxStorageSize
 		s.mu.Unlock()
 		
@@ -187,7 +255,7 @@ func (s *Store) Store(content, summary, category string, tags []string, metadata
 	return memory, nil
 }
 
-// Get retrieves a memory by ID
+// Get retrieves a memory by ID (returns current version if base ID is provided)
 func (s *Store) Get(id string) (*Memory, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -206,7 +274,7 @@ func (s *Store) Get(id string) (*Memory, error) {
 		s.logger.WithError(err).Warn("Failed to update memory access stats")
 	}
 
-	s.logger.Debug("Retrieved memory", "id", id, "access_count", memory.AccessCount)
+	s.logger.Debug("Retrieved memory", "id", id, "version", memory.Version, "access_count", memory.AccessCount)
 	return memory, nil
 }
 
@@ -349,6 +417,37 @@ func (s *Store) List(category string, tags []string, limit int) ([]*Memory, erro
 	return results, nil
 }
 
+// GetHistory retrieves all versions of a memory
+func (s *Store) GetHistory(baseID string) ([]*Memory, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Remove version suffix if provided
+	if idx := strings.LastIndex(baseID, "-v"); idx != -1 {
+		baseID = baseID[:idx]
+	}
+
+	versionIDs, exists := s.versionIndex[baseID]
+	if !exists || len(versionIDs) == 0 {
+		return nil, fmt.Errorf("no versions found for memory: %s", baseID)
+	}
+
+	var versions []*Memory
+	for _, versionID := range versionIDs {
+		if memory, exists := s.index[versionID]; exists {
+			versions = append(versions, memory)
+		}
+	}
+
+	// Sort by version number (newest first)
+	sort.Slice(versions, func(i, j int) bool {
+		return versions[i].Version > versions[j].Version
+	})
+
+	s.logger.Debug("Retrieved memory history", "base_id", baseID, "versions", len(versions))
+	return versions, nil
+}
+
 // Delete removes a memory
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
@@ -360,22 +459,201 @@ func (s *Store) Delete(id string) error {
 
 	// Remove file
 	filename := fmt.Sprintf("%s.json", id)
+	if s.config.EnableCompression {
+		filename = fmt.Sprintf("%s.json.gz", id)
+	}
 	filepath := filepath.Join(s.dataDir, "memories", filename)
 	if err := os.Remove(filepath); err != nil {
 		return fmt.Errorf("failed to remove memory file: %w", err)
 	}
+
+	// Get memory before removing
+	memory := s.index[id]
 
 	// Update storage size
 	s.totalSize -= s.memorySizes[id]
 	delete(s.memorySizes, id)
 
 	// Remove from indices
-	memory := s.index[id]
 	s.removeFromIndices(memory)
 	delete(s.index, id)
 
 	s.logger.Info("Memory deleted", "id", id)
 	return nil
+}
+
+// BulkDelete deletes multiple memories based on the provided options
+func (s *Store) BulkDelete(options *BulkDeleteOptions) (int, error) {
+	// Validate options - require at least one filter
+	if !options.Confirm {
+		return 0, fmt.Errorf("confirmation required: set confirm to true")
+	}
+
+	if options.Category == "" && len(options.Tags) == 0 && options.BeforeDate.IsZero() && options.Query == "" {
+		return 0, fmt.Errorf("at least one filter (category, tags, beforeDate, or query) must be specified")
+	}
+
+	s.mu.Lock()
+	// First, collect all memories that match the criteria
+	var toDelete []string
+	queryLower := strings.ToLower(options.Query)
+	
+	// Track base IDs that have been matched to ensure we delete all versions
+	baseIDsToDelete := make(map[string]bool)
+
+	for id, memory := range s.index {
+		// Skip non-current versions initially, we'll handle them via baseIDsToDelete
+		if !memory.IsCurrentVersion && !strings.Contains(id, "-v") {
+			continue
+		}
+		
+		matches := true
+
+		// Filter by category
+		if options.Category != "" && memory.Category != options.Category {
+			matches = false
+		}
+
+		// Filter by tags (must have at least one matching tag)
+		if matches && len(options.Tags) > 0 {
+			hasMatchingTag := false
+			for _, filterTag := range options.Tags {
+				for _, memoryTag := range memory.Tags {
+					if strings.EqualFold(memoryTag, filterTag) {
+						hasMatchingTag = true
+						break
+					}
+				}
+				if hasMatchingTag {
+					break
+				}
+			}
+			if !hasMatchingTag {
+				matches = false
+			}
+		}
+
+		// Filter by date
+		if matches && !options.BeforeDate.IsZero() && !memory.CreatedAt.Before(options.BeforeDate) {
+			matches = false
+		}
+
+		// Filter by query content
+		if matches && options.Query != "" {
+			contentMatches := strings.Contains(strings.ToLower(memory.Content), queryLower)
+			summaryMatches := memory.Summary != "" && strings.Contains(strings.ToLower(memory.Summary), queryLower)
+			if !contentMatches && !summaryMatches {
+				matches = false
+			}
+		}
+
+		if matches {
+			// Extract base ID
+			baseID := id
+			if idx := strings.LastIndex(id, "-v"); idx != -1 {
+				baseID = id[:idx]
+			}
+			baseIDsToDelete[baseID] = true
+		}
+	}
+	
+	// Now collect all versions of matched memories
+	for baseID := range baseIDsToDelete {
+		// Add all versions from the version index
+		if versionIDs, exists := s.versionIndex[baseID]; exists {
+			toDelete = append(toDelete, versionIDs...)
+		}
+		// Also add the base ID reference if it exists
+		if _, exists := s.index[baseID]; exists {
+			// Don't add duplicates
+			alreadyAdded := false
+			for _, id := range toDelete {
+				if id == baseID {
+					alreadyAdded = true
+					break
+				}
+			}
+			if !alreadyAdded {
+				toDelete = append(toDelete, baseID)
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	// Delete the memories
+	deletedCount := 0
+	var errors []string
+	
+	for _, id := range toDelete {
+		// Skip if this is a base ID that points to a versioned memory (not an actual file)
+		s.mu.RLock()
+		memory, exists := s.index[id]
+		s.mu.RUnlock()
+		
+		if !exists {
+			continue
+		}
+		
+		// Skip base ID entries that are just references
+		if !strings.Contains(id, "-v") && memory.Version > 0 {
+			// This is just a reference to the current version, not an actual memory file
+			s.mu.Lock()
+			delete(s.index, id)
+			s.mu.Unlock()
+			continue
+		}
+
+		// Try to delete the actual memory file
+		filename := fmt.Sprintf("%s.json", id)
+		if s.config.EnableCompression {
+			filename = fmt.Sprintf("%s.json.gz", id)
+		}
+		filepath := filepath.Join(s.dataDir, "memories", filename)
+		
+		// Check if file exists before trying to remove it
+		if _, err := os.Stat(filepath); err == nil {
+			if err := os.Remove(filepath); err != nil {
+				errors = append(errors, fmt.Sprintf("failed to delete %s: %v", id, err))
+				continue
+			}
+		}
+
+		// Update indices
+		s.mu.Lock()
+		if memory, exists := s.index[id]; exists {
+			s.totalSize -= s.memorySizes[id]
+			delete(s.memorySizes, id)
+			s.removeFromIndices(memory)
+			delete(s.index, id)
+			deletedCount++
+		}
+		s.mu.Unlock()
+	}
+
+	// Clean up version index for deleted base IDs
+	s.mu.Lock()
+	for baseID := range baseIDsToDelete {
+		delete(s.versionIndex, baseID)
+	}
+	s.mu.Unlock()
+
+	if len(errors) > 0 {
+		s.logger.Warn("Some memories could not be deleted", 
+			"errors", strings.Join(errors, "; "),
+			"deleted_count", deletedCount,
+			"failed_count", len(errors))
+	}
+
+	s.logger.Info("Bulk delete completed", 
+		"deleted_count", deletedCount,
+		"filters", map[string]interface{}{
+			"category": options.Category,
+			"tags": options.Tags,
+			"before_date": options.BeforeDate,
+			"query": options.Query,
+		})
+
+	return deletedCount, nil
 }
 
 // Close gracefully shuts down the store
@@ -504,6 +782,15 @@ func (s *Store) saveMemoryToFile(memory *Memory) (int64, error) {
 		// Use uncompressed data
 		fileData = data
 	}
+	
+	// Encrypt if enabled
+	if s.config.EnableEncryption && s.crypto != nil {
+		encrypted, err := s.crypto.Encrypt(fileData)
+		if err != nil {
+			return 0, fmt.Errorf("failed to encrypt data: %w", err)
+		}
+		fileData = encrypted
+	}
 
 	// Check file size limit
 	if int64(len(fileData)) > s.config.MaxFileSize {
@@ -547,10 +834,22 @@ func (s *Store) loadIndex() error {
 			continue
 		}
 
-		data, err := os.ReadFile(filepath)
+		fileData, err := os.ReadFile(filepath)
 		if err != nil {
 			s.logger.WithError(err).Warn("Failed to read memory file", "file", entry.Name())
 			continue
+		}
+
+		// Decrypt if enabled
+		var data []byte
+		if s.config.EnableEncryption && s.crypto != nil {
+			data, err = s.crypto.Decrypt(fileData)
+			if err != nil {
+				s.logger.WithError(err).Warn("Failed to decrypt memory", "file", entry.Name())
+				continue
+			}
+		} else {
+			data = fileData
 		}
 
 		// Decompress if gzipped
@@ -581,6 +880,39 @@ func (s *Store) loadIndex() error {
 		s.memorySizes[memory.ID] = info.Size()
 		s.totalSize += info.Size()
 		s.updateIndices(&memory)
+		
+		// Build version index
+		if memory.IsCurrentVersion {
+			// Extract base ID from versioned ID (remove -vN suffix)
+			baseID := memory.ID
+			if idx := strings.LastIndex(memory.ID, "-v"); idx != -1 {
+				baseID = memory.ID[:idx]
+			}
+			// Also index by base ID for quick lookup
+			s.index[baseID] = &memory
+		}
+		
+		// Add to version index
+		if memory.Version > 0 {
+			baseID := memory.ID
+			if idx := strings.LastIndex(memory.ID, "-v"); idx != -1 {
+				baseID = memory.ID[:idx]
+			}
+			s.versionIndex[baseID] = append(s.versionIndex[baseID], memory.ID)
+		}
+	}
+
+	// Sort version indices by version number
+	for baseID, versionIDs := range s.versionIndex {
+		sort.Slice(versionIDs, func(i, j int) bool {
+			memI := s.index[versionIDs[i]]
+			memJ := s.index[versionIDs[j]]
+			if memI != nil && memJ != nil {
+				return memI.Version < memJ.Version
+			}
+			return false
+		})
+		s.versionIndex[baseID] = versionIDs
 	}
 
 	return nil
@@ -708,7 +1040,7 @@ func (s *Store) cleanupOldMemories() error {
 		memories = append(memories, memoryWithTime{
 			id:         id,
 			lastAccess: memory.LastAccess,
-			size:       s.memorySizes[id],
+			size:       s.memorySizes[memory.ID],
 		})
 	}
 
@@ -780,14 +1112,30 @@ type ReadOnlyStore struct {
 	logger  *logger.Logger
 	mu      sync.RWMutex
 	index   map[string]*Memory
+	crypto  *crypto.Crypto // encryption handler for decryption
 }
 
 // NewReadOnlyStore creates a new read-only memory store for reporting
 func NewReadOnlyStore(dataDir string, log *logger.Logger) (*ReadOnlyStore, error) {
+	return NewReadOnlyStoreWithConfig(dataDir, nil, log)
+}
+
+// NewReadOnlyStoreWithConfig creates a new read-only memory store with optional config for encryption
+func NewReadOnlyStoreWithConfig(dataDir string, cfg *config.StorageConfig, log *logger.Logger) (*ReadOnlyStore, error) {
 	store := &ReadOnlyStore{
 		dataDir: dataDir,
 		logger:  log.WithComponent("readonly_memory_store"),
 		index:   make(map[string]*Memory),
+	}
+
+	// Initialize encryption if config provided and enabled
+	if cfg != nil && cfg.EnableEncryption {
+		cryptoHandler, err := crypto.New(cfg.EncryptionKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize encryption: %w", err)
+		}
+		store.crypto = cryptoHandler
+		log.Info("Encryption enabled for read-only store", "key_path", cfg.EncryptionKeyPath)
 	}
 
 	// Load existing memories into index
@@ -1005,10 +1353,22 @@ func (s *ReadOnlyStore) loadIndex() error {
 
 		filepath := filepath.Join(memoriesDir, entry.Name())
 
-		data, err := os.ReadFile(filepath)
+		fileData, err := os.ReadFile(filepath)
 		if err != nil {
 			s.logger.WithError(err).Warn("Failed to read memory file", "file", entry.Name())
 			continue
+		}
+
+		// Decrypt if enabled
+		var data []byte
+		if s.crypto != nil {
+			data, err = s.crypto.Decrypt(fileData)
+			if err != nil {
+				s.logger.WithError(err).Warn("Failed to decrypt memory", "file", entry.Name())
+				continue
+			}
+		} else {
+			data = fileData
 		}
 
 		// Decompress if gzipped

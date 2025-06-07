@@ -129,6 +129,13 @@ Configure the server using environment variables:
 | `MCP_ENABLE_COMPRESSION` | Enable gzip compression for memory files | `true` |
 | `MCP_COMPRESSION_LEVEL` | Gzip compression level (1-9, where 9 is maximum) | `6` |
 
+### Encryption Configuration
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MCP_ENABLE_ENCRYPTION` | Enable AES-256-GCM encryption for memory files | `false` |
+| `MCP_ENCRYPTION_KEY_PATH` | Path to encryption key file | `~/.mcp-memory/encryption.key` |
+
 ### Other Configuration
 
 | Variable | Description | Default |
@@ -147,7 +154,8 @@ Memories are stored in your configured data directory:
 ~/.mcp-memory/
 ├── memories/           # Individual memory JSON files
 ├── index/             # Search indexes (future enhancement)
-└── logs/              # Application logs
+├── logs/              # Application logs
+└── encryption.key     # Encryption key (if encryption is enabled)
 ```
 
 Each memory includes:
@@ -157,6 +165,11 @@ Each memory includes:
 - Creation and update timestamps
 - Access statistics and last access time
 - Custom metadata
+
+Memory files are:
+- Compressed with gzip (configurable)
+- Encrypted with AES-256-GCM (optional)
+- Stored as individual JSON files for reliability
 
 ### Performance Tuning
 
